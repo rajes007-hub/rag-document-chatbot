@@ -1,37 +1,36 @@
 import streamlit as st
 import os
+import tempfile
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_community.document_loaders import TextLoader, PyPDFLoader
+from langchain_text_splitters import CharacterTextSplitter
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-# Load environment variables
-# When running locally, it reads from .env file
-# When deployed, we'll use Streamlit secrets instead
 if os.path.exists('.env'):
     load_dotenv()
 else:
-    # Running on Streamlit Cloud - use secrets
     if hasattr(st, 'secrets'):
         os.environ['GROQ_API_KEY'] = st.secrets.get("GROQ_API_KEY", "")
 
-# =============================================================================
-# SESSION STATE INITIALIZATION
-# =============================================================================
 
-# Session state stores data that persists across reruns
-# Think of it like variables that don't reset when page refreshes
+# SESSION STATE INITIALIZATION
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 
-# =============================================================================
+if 'vector_db' not in st.session_state:
+    st.session_state.vector_db = None
+
+if 'use_default_docs' not in st.session_state:
+    st.session_state.use_default_docs = True
+
+if 'uploaded_files_processed' not in st.session_state:
+    st.session_state.uploaded_files_processed = []
+
+
 # PAGE SETUP
-# =============================================================================
 
 st.set_page_config(
     page_title="RAG Document Q&A",
@@ -40,101 +39,118 @@ st.set_page_config(
 )
 
 st.title("📚 Document Q&A Chatbot")
-st.markdown("Ask questions about your documents using RAG!")
+st.markdown("Ask questions about documents - use default docs or upload your own!")
 
-# =============================================================================
-# LOAD RAG SYSTEM (CACHED)
-# =============================================================================
 
-@st.cache_resource  # This decorator caches the function so it only runs once
-def load_rag_system():
-    """
-    Load the vector database and language model
-    This is cached so it doesn't reload on every interaction
-    """
-    persistent_directory = "db/chroma_db"
+# HELPER FUNCTIONS
+
+@st.cache_resource
+def get_embedding_model():
     
-    # Check if database exists
-    if not os.path.exists(persistent_directory):
-        st.error("❌ Database not found! Please run ingest.py first.")
-        st.stop()
-    
-    # Load embeddings model (same one used during ingestion)
-    embedding_model = HuggingFaceEmbeddings(
+    return HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
+
+@st.cache_resource
+def get_llm():
     
-    # Load vector database
+    return ChatGroq(
+        model="llama-3.1-8b-instant",
+        temperature=0
+    )
+
+@st.cache_resource
+def load_default_db():
+    
+    persistent_directory = "db/chroma_db"
+    
+    if not os.path.exists(persistent_directory):
+        return None
+    
+    embedding_model = get_embedding_model()
+    
     db = Chroma(
         persist_directory=persistent_directory,
         embedding_function=embedding_model,
         collection_metadata={"hnsw:space": "cosine"}
     )
     
-    # Initialize Groq LLM
-    model = ChatGroq(
-        model="llama-3.1-8b-instant",
-        temperature=0
-    )
-    
-    return db, model
+    return db
 
-# =============================================================================
-# MAIN APP
-# =============================================================================
+def process_uploaded_file(uploaded_file):
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_path = tmp_file.name
+    
+    try:
+        if uploaded_file.name.endswith('.pdf'):
+            loader = PyPDFLoader(tmp_path)
+        elif uploaded_file.name.endswith('.txt'):
+            loader = TextLoader(tmp_path, encoding='utf-8')
+        else:
+            st.error(f"Unsupported file type: {uploaded_file.name}")
+            return None
+        
+        documents = loader.load()
+        
+        text_splitter = CharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100
+        )
+        chunks = text_splitter.split_documents(documents)
+        
+        return chunks
+    
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
-try:
-    # Load the RAG system
-    db, model = load_rag_system()
+def create_vectordb_from_uploads(uploaded_files):
+    all_chunks = []
     
-    # Create two columns for layout
-    col1, col2 = st.columns([3, 1])
+    with st.spinner("Processing uploaded files..."):
+        for uploaded_file in uploaded_files:
+            chunks = process_uploaded_file(uploaded_file)
+            if chunks:
+                all_chunks.extend(chunks)
+                st.success(f"✅ Processed: {uploaded_file.name} ({len(chunks)} chunks)")
     
-    with col1:
-        st.subheader("💬 Chat")
-        
-        # Display chat history
-        for message in st.session_state.chat_history:
-            if isinstance(message, HumanMessage):
-                with st.chat_message("user"):
-                    st.write(message.content)
-            elif isinstance(message, AIMessage):
-                with st.chat_message("assistant"):
-                    st.write(message.content)
-        
-        # Chat input at the bottom
-        user_question = st.chat_input("Ask a question about your documents...")
-        
-        if user_question:
-            # Display user message immediately
-            with st.chat_message("user"):
-                st.write(user_question)
-            
-            # Generate and display assistant response
-            with st.chat_message("assistant"):
-                with st.spinner("🤔 Thinking..."):
-                    
-                    # Step 1: Rewrite question if chat history exists
-                    if st.session_state.chat_history:
-                        messages = [
-                            SystemMessage(content="Rewrite this question to be standalone based on the chat history. Return ONLY the rewritten question, nothing else."),
-                        ] + st.session_state.chat_history + [
-                            HumanMessage(content=f"New question: {user_question}")
-                        ]
-                        result = model.invoke(messages)
-                        search_question = result.content.strip()
-                    else:
-                        search_question = user_question
-                    
-                    # Step 2: Retrieve relevant documents
-                    retriever = db.as_retriever(search_kwargs={"k": 3})
-                    docs = retriever.invoke(search_question)
-                    
-                    # Step 3: Create context from documents
-                    docs_text = "\n\n".join([f"Document {i+1}:\n{doc.page_content}" for i, doc in enumerate(docs)])
-                    
-                    # Step 4: Create the prompt
-                    combined_input = f"""Based on the following documents, please answer this question: {user_question}
+    if not all_chunks:
+        st.error("No valid documents to process!")
+        return None
+    
+    with st.spinner("Building vector database..."):
+        embedding_model = get_embedding_model()
+        db = Chroma.from_documents(
+            documents=all_chunks,
+            embedding=embedding_model,
+            collection_metadata={"hnsw:space": "cosine"}
+        )
+    
+    return db
+
+def query_documents(user_question, db, model):
+    if st.session_state.chat_history:
+        messages = [
+            SystemMessage(content="Rewrite this question to be standalone based on the chat history. Return ONLY the rewritten question."),
+        ] + st.session_state.chat_history + [
+            HumanMessage(content=f"New question: {user_question}")
+        ]
+        result = model.invoke(messages)
+        search_question = result.content.strip()
+    else:
+        search_question = user_question
+    
+    
+    retriever = db.as_retriever(search_kwargs={"k": 3})
+    docs = retriever.invoke(search_question)
+    
+    
+    docs_text = "\n\n".join([f"Document {i+1}:\n{doc.page_content}" for i, doc in enumerate(docs)])
+    
+
+    combined_input = f"""Based on the following documents, please answer this question: {user_question}
 
 Documents:
 {docs_text}
@@ -144,75 +160,151 @@ Instructions:
 - If you cannot find the answer in the documents, say "I don't have enough information to answer that question based on the provided documents."
 - Be concise but complete
 """
-                    
-                    # Step 5: Get answer from LLM
-                    messages = [
-                        SystemMessage(content="You are a helpful assistant that answers questions based on provided documents and conversation history. Be concise and accurate."),
-                    ] + st.session_state.chat_history + [
-                        HumanMessage(content=combined_input)
-                    ]
-                    
-                    result = model.invoke(messages)
-                    answer = result.content
-                    
-                    # Display the answer
-                    st.write(answer)
-                    
-                    # Optional: Show retrieved documents in an expander
-                    with st.expander("📄 View source documents"):
-                        for i, doc in enumerate(docs, 1):
-                            st.markdown(f"**Document {i}:**")
-                            st.text(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
-                            st.divider()
-                    
-                    # Save to chat history
-                    st.session_state.chat_history.append(HumanMessage(content=user_question))
-                    st.session_state.chat_history.append(AIMessage(content=answer))
     
-    # Sidebar
-    with col2:
-        st.subheader("⚙️ Settings")
-        
-        # Show database stats
-        try:
-            doc_count = db._collection.count()
-            st.metric("Documents in DB", doc_count)
-        except:
-            st.metric("Documents in DB", "Unknown")
-        
-        st.metric("Chat Messages", len(st.session_state.chat_history))
-        
-        # Clear chat button
-        if st.button("🗑️ Clear Chat History", use_container_width=True):
-            st.session_state.chat_history = []
-            st.rerun()
-        
-        # Info section
-        st.divider()
-        st.markdown("### 📖 How it works")
-        st.markdown("""
-        1. Your question is processed
-        2. Relevant documents are retrieved
-        3. AI generates answer based on documents
-        4. Sources are shown below
-        """)
-        
-        st.divider()
-        st.markdown("### 🔑 Tech Stack")
-        st.markdown("""
-        - **LLM:** Groq (Llama 3.1)
-        - **Embeddings:** HuggingFace
-        - **Vector DB:** ChromaDB
-        - **Framework:** LangChain
-        """)
+    
+    messages = [
+        SystemMessage(content="You are a helpful assistant that answers questions based on provided documents and conversation history. Be concise and accurate."),
+    ] + st.session_state.chat_history + [
+        HumanMessage(content=combined_input)
+    ]
+    
+    result = model.invoke(messages)
+    answer = result.content
+    
+    return answer, docs
 
-except Exception as e:
-    st.error(f"❌ Error loading RAG system: {e}")
-    st.info("""
-    **Troubleshooting:**
-    1. Make sure you've run `ingest.py` first
-    2. Check that `db/chroma_db` folder exists
-    3. Verify your GROQ_API_KEY is set correctly
-    4. Install all requirements: `pip install -r requirements.txt`
+
+# SIDEBAR for Document Selection
+
+with st.sidebar:
+    st.header("📂 Document Source")
+    
+    doc_source = st.radio(
+        "Choose document source:",
+        ["Use Default Documents", "Upload My Own Documents"],
+        key="doc_source"
+    )
+    
+    if doc_source == "Upload My Own Documents":
+        st.session_state.use_default_docs = False
+        
+        uploaded_files = st.file_uploader(
+            "Upload documents (PDF or TXT)",
+            type=['pdf', 'txt'],
+            accept_multiple_files=True,
+            help="Upload one or more PDF or TXT files to query"
+        )
+        
+        if uploaded_files:
+    
+            current_file_names = [f.name for f in uploaded_files]
+            
+            if current_file_names != st.session_state.uploaded_files_processed:
+                
+                st.session_state.vector_db = create_vectordb_from_uploads(uploaded_files)
+                st.session_state.uploaded_files_processed = current_file_names
+                st.session_state.chat_history = []  
+                
+                if st.session_state.vector_db:
+                    st.success(f"✅ Ready to query {len(uploaded_files)} file(s)!")
+        else:
+            st.info("👆 Upload files to get started")
+            st.session_state.vector_db = None
+    
+    else:
+        st.session_state.use_default_docs = True
+        st.session_state.vector_db = load_default_db()
+        st.session_state.uploaded_files_processed = []
+        
+        if st.session_state.vector_db:
+            try:
+                doc_count = st.session_state.vector_db._collection.count()
+                st.success(f"✅ Using default database ({doc_count} documents)")
+            except:
+                st.success("✅ Using default database")
+    
+    st.divider()
+    
+    # Stats
+    st.subheader("⚙️ Settings")
+    st.metric("Chat Messages", len(st.session_state.chat_history))
+    
+    if st.button("🗑️ Clear Chat History", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
+    
+    st.divider()
+    
+    # Info
+    st.markdown("### 📖 How it works")
+    st.markdown("""
+    1. Choose document source
+    2. Ask your question
+    3. AI retrieves relevant context
+    4. Generates accurate answer
     """)
-    st.exception(e)  # Show full error for debugging
+    
+    st.divider()
+    st.markdown("### 🔑 Tech Stack")
+    st.markdown("""
+    - **LLM:** Groq (Llama 3.1)
+    - **Embeddings:** HuggingFace
+    - **Vector DB:** ChromaDB
+    - **Framework:** LangChain
+    """)
+
+
+# MAIN CHAT INTERFACE
+
+if st.session_state.vector_db is None:
+    if st.session_state.use_default_docs:
+        st.error("❌ Default database not found! Please upload your own documents or check that db/chroma_db exists.")
+    else:
+        st.info("👈 Please upload documents from the sidebar to get started")
+    st.stop()
+
+model = get_llm()
+
+for message in st.session_state.chat_history:
+    if isinstance(message, HumanMessage):
+        with st.chat_message("user"):
+            st.write(message.content)
+    elif isinstance(message, AIMessage):
+        with st.chat_message("assistant"):
+            st.write(message.content)
+
+
+user_question = st.chat_input("Ask a question about your documents...")
+
+if user_question:
+    with st.chat_message("user"):
+        st.write(user_question)
+    
+    
+    with st.chat_message("assistant"):
+        with st.spinner("🤔 Thinking..."):
+            try:
+                answer, source_docs = query_documents(
+                    user_question,
+                    st.session_state.vector_db,
+                    model
+                )
+                
+        
+                st.write(answer)
+                
+                
+                with st.expander("📄 View source documents"):
+                    for i, doc in enumerate(source_docs, 1):
+                        st.markdown(f"**Document {i}:**")
+                        preview = doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content
+                        st.text(preview)
+                        st.divider()
+                
+                
+                st.session_state.chat_history.append(HumanMessage(content=user_question))
+                st.session_state.chat_history.append(AIMessage(content=answer))
+            
+            except Exception as e:
+                st.error(f"❌ Error: {e}")
+                st.exception(e)

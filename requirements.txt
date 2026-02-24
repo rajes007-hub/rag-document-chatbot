@@ -1,6 +1,5 @@
 streamlit
 langchain
-langchain-core
 langchain-chroma
 langchain-huggingface
 langchain-groq
@@ -9,4 +8,5 @@ python-dotenv
 chromadb
 sentence-transformers
 torch
+pypdf
 
